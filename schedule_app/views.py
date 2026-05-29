@@ -6,11 +6,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework import serializers as drf_serializers
 from django_filters.rest_framework import DjangoFilterBackend
+from django.shortcuts import get_object_or_404
 
 from .models import (
     School, BellSchedule, AcademicYear, VacationType, VacationPeriod,
     Room, Teacher, ClassGroup, ClassSubgroup, Subject, ScheduleEntry,
 )
+from .generation import generate_schedule
 from .serializers import (
     RegisterSerializer, UserSerializer,
     SchoolSerializer, BellScheduleSerializer, AcademicYearSerializer,
@@ -208,11 +210,12 @@ class GenerateScheduleView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # TODO: запустить алгоритм генерации расписания
-        # from .generation import generate_schedule
-        # result = generate_schedule(academic_year_id)
-
-        return Response(
-            {"detail": f"Генерация расписания для учебного года {academic_year_id} запущена."},
-            status=status.HTTP_202_ACCEPTED
+        get_object_or_404(AcademicYear, pk=academic_year_id)
+        result = generate_schedule(int(academic_year_id))
+        response_status = (
+            status.HTTP_201_CREATED
+            if result["unscheduled_count"] == 0
+            else status.HTTP_409_CONFLICT
         )
+
+        return Response(result, status=response_status)

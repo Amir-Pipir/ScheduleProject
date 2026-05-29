@@ -373,6 +373,10 @@ class CurriculumPlan(models.Model):
         ClassGroup, on_delete=models.CASCADE, related_name="curriculum_plans",
         verbose_name="Класс"
     )
+
+    subgroup = models.ForeignKey(ClassSubgroup, on_delete=models.CASCADE, null=True, blank=True,
+                                 related_name="curriculum_plans", verbose_name="Подгруппа")
+
     subject = models.ForeignKey(
         Subject, on_delete=models.CASCADE, related_name="curriculum_plans",
         verbose_name="Предмет"
@@ -389,7 +393,7 @@ class CurriculumPlan(models.Model):
         ordering = ["class_group", "subject", "semester"]
         verbose_name = "Учебный план"
         verbose_name_plural = "Учебные планы"
-        unique_together = [("class_group", "subject", "semester")]
+        unique_together = [("class_group", "subgroup", "subject", "semester")]
 
     def __str__(self):
         return f"{self.class_group} | {self.subject} | {self.get_semester_display()}"
