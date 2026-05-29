@@ -1,3 +1,5 @@
+import threading
+
 from django.contrib.auth.models import User
 from drf_spectacular.utils import extend_schema, inline_serializer
 from rest_framework import generics, viewsets, permissions, filters, status
@@ -211,11 +213,19 @@ class GenerateScheduleView(APIView):
             )
 
         get_object_or_404(AcademicYear, pk=academic_year_id)
-        result = generate_schedule(int(academic_year_id))
-        response_status = (
-            status.HTTP_201_CREATED
-            if result["unscheduled_count"] == 0
-            else status.HTTP_409_CONFLICT
-        )
 
-        return Response(result, status=response_status)
+        # Запускаем в фоновом потоке
+        def run():
+            try:
+                generate_schedule(int(academic_year_id))
+            except Exception as e:
+                # Здесь можно записать ошибку в лог или в БД
+                print(f"Ошибка генерации: {e}")
+
+        thread = threading.Thread(target=run)
+        thread.start()
+
+        return Response(
+            {"detail": f"Генерация расписания для учебного года {academic_year_id} запущена в фоновом режиме."},
+            status=status.HTTP_202_ACCEPTED
+        )

@@ -41,6 +41,11 @@ class Candidate:
     score: int
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 class ScheduleGenerator:
     def __init__(self, academic_year_id: int):
         self.academic_year = AcademicYear.objects.select_related("school").get(pk=academic_year_id)
@@ -69,36 +74,47 @@ class ScheduleGenerator:
         self.subjects_with_room_requirements = set()
         self.teacher_unavailable = set()
         self.room_unavailable = set()
+        self.teacher_day_periods = defaultdict(set)
 
     def run(self):
-        self._load_context()
-        tasks = self._build_tasks()
-        if not tasks:
-            return self._result(0)
+        try:
+            self._load_context()
+            tasks = self._build_tasks()
+            if not tasks:
+                return self._result(0)
 
-        tasks.sort(key=self._task_sort_key)
-        solved = self._solve(tasks, 0)
+            tasks.sort(key=self._task_sort_key)
+            solved = self._solve(tasks, 0)
 
-        if not solved:
-            self.entries = []
-            if not self.unscheduled:
-                self.unscheduled.append(
-                    {
-                        "reason": "constraints_conflict",
-                        "detail": "Не удалось разместить все уроки без нарушения ограничений.",
-                    }
-                )
-            return self._result(0)
+            if not solved:
+                self.entries = []
+                if not self.unscheduled:
+                    self.unscheduled.append(
+                        {
+                            "reason": "constraints_conflict",
+                            "detail": "Не удалось разместить все уроки без нарушения ограничений.",
+                        }
+                    )
+                return self._result(0)
 
-        with transaction.atomic():
-            ScheduleEntry.objects.filter(
-                academic_year=self.academic_year,
-                class_group__school=self.school,
-                is_substitution=False,
-            ).delete()
-            ScheduleEntry.objects.bulk_create(self.entries)
+            with transaction.atomic():
+                ScheduleEntry.objects.filter(
+                    academic_year=self.academic_year,
+                    class_group__school=self.school,
+                    is_substitution=False,
+                ).delete()
+                ScheduleEntry.objects.bulk_create(self.entries)
 
-        return self._result(len(self.entries))
+            return self._result(len(self.entries))
+        except Exception as e:
+            logger.exception("Ошибка в ScheduleGenerator.run")
+            return {
+                "detail": f"Ошибка генерации: {e}",
+                "academic_year_id": self.academic_year.id,
+                "generated_count": 0,
+                "unscheduled_count": 1,
+                "unscheduled": [{"reason": "exception", "detail": str(e)}],
+            }
 
     def _load_context(self):
         self.class_groups = list(
