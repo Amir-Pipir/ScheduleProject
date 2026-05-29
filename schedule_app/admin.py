@@ -230,13 +230,15 @@ class ScheduleEntryAdmin(admin.ModelAdmin):
 
     def export_to_csv(self, request, queryset):
         """Экспорт выбранных записей расписания в CSV-файл"""
-        # Если ничего не выбрано, используем весь queryset (можно и так, но обычно действуют только на выбранные)
         if not queryset.exists():
             self.message_user(request, "Не выбрано ни одной записи для экспорта.", level="ERROR")
             return
 
-        response = HttpResponse(content_type="text/csv")
+        # Создаём ответ с указанием кодировки UTF-8 и добавляем BOM для Excel
+        response = HttpResponse(content_type="text/csv; charset=utf-8")
         response["Content-Disposition"] = 'attachment; filename="schedule_export.csv"'
+        # Добавляем BOM (Byte Order Mark) для корректного распознавания UTF-8 в Excel
+        response.write('\ufeff')
         writer = csv.writer(response)
         # Заголовки столбцов
         writer.writerow([
