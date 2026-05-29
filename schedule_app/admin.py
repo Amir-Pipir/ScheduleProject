@@ -6,6 +6,8 @@ from .models import (
     Subject, SubjectRoomRequirement, CurriculumPlan, TeacherSubject,
     SanpinLimit, ScheduleEntry,
 )
+import csv
+from django.http import HttpResponse
 
 
 # ── Inlines ────────────────────────────────────────────────────────────────────
@@ -224,3 +226,55 @@ class ScheduleEntryAdmin(admin.ModelAdmin):
     ]
     autocomplete_fields = ["class_group", "subject", "teacher", "room"]
     list_select_related = ["class_group", "subject", "teacher", "room", "subgroup"]
+    actions = ["export_to_csv"]
+
+    def export_to_csv(self, request, queryset):
+        """Экспорт выбранных записей расписания в CSV-файл"""
+        # Если ничего не выбрано, используем весь queryset (можно и так, но обычно действуют только на выбранные)
+        if not queryset.exists():
+            self.message_user(request, "Не выбрано ни одной записи для экспорта.", level="ERROR")
+            return
+
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = 'attachment; filename="schedule_export.csv"'
+        writer = csv.writer(response)
+        # Заголовки столбцов
+        writer.writerow([
+            "Школа", "Учебный год", "Класс", "Подгруппа", "День недели",
+            "Номер урока", "Предмет", "Учитель", "Кабинет", "Чётность недели",
+            "Замена", "Действует с", "Действует по"
+        ])
+
+        # Данные
+        for entry in queryset.select_related(
+                "class_group__school",
+                "academic_year",
+                "subgroup",
+                "subject",
+                "teacher",
+                "room"
+        ):
+            days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+            day_name = days[entry.day_of_week - 1] if 1 <= entry.day_of_week <= 7 else str(entry.day_of_week)
+            parity = {0: "Обе недели", 1: "Нечётная", 2: "Чётная"}.get(entry.week_parity, str(entry.week_parity))
+
+            writer.writerow([
+                entry.class_group.school.name if entry.class_group else "",
+                str(entry.academic_year) if entry.academic_year else "",
+                entry.class_group.name if entry.class_group else "",
+                entry.subgroup.name if entry.subgroup else "",
+                day_name,
+                entry.period_number,
+                entry.subject.name if entry.subject else "",
+                entry.teacher.full_name if entry.teacher else "",
+                entry.room.number if entry.room else "",
+                parity,
+                "Да" if entry.is_substitution else "Нет",
+                entry.valid_from,
+                entry.valid_to or ""
+            ])
+
+        self.message_user(request, f"Экспортировано {queryset.count()} записей.")
+        return response
+
+    export_to_csv.short_description = "Экспорт выбранных записей в CSV"
