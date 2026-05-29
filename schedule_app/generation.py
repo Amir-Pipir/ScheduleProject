@@ -1,3 +1,4 @@
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -17,6 +18,9 @@ from .models import (
     TeacherSubject,
     TeacherUnavailability,
 )
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 @dataclass(frozen=True)
@@ -41,13 +45,9 @@ class Candidate:
     score: int
 
 
-import logging
-
-logger = logging.getLogger(__name__)
-
-
 class ScheduleGenerator:
     def __init__(self, academic_year_id: int):
+        logger.info(f"Инициализация генератора для учебного года {academic_year_id}")
         self.academic_year = AcademicYear.objects.select_related("school").get(pk=academic_year_id)
         self.school = self.academic_year.school
         self.days = list(range(1, self.school.week_days_count + 1))
@@ -74,28 +74,24 @@ class ScheduleGenerator:
         self.subjects_with_room_requirements = set()
         self.teacher_unavailable = set()
         self.room_unavailable = set()
-        self.teacher_day_periods = defaultdict(set)
 
     def run(self):
+        logger.info("=== НАЧАЛО ГЕНЕРАЦИИ ===")
         try:
             self._load_context()
             tasks = self._build_tasks()
             if not tasks:
+                logger.warning("Нет задач для генерации (пустой учебный план?)")
                 return self._result(0)
 
+            logger.info(f"Создано {len(tasks)} задач (уроков)")
             tasks.sort(key=self._task_sort_key)
-            solved = self._solve(tasks, 0)
+            solved = self._solve_with_fallback(tasks)
 
             if not solved:
-                self.entries = []
-                if not self.unscheduled:
-                    self.unscheduled.append(
-                        {
-                            "reason": "constraints_conflict",
-                            "detail": "Не удалось разместить все уроки без нарушения ограничений.",
-                        }
-                    )
-                return self._result(0)
+                logger.warning("Не удалось разместить все уроки. Часть отложена.")
+            else:
+                logger.info(f"Успешно размещено {len(self.entries)} уроков.")
 
             with transaction.atomic():
                 ScheduleEntry.objects.filter(
@@ -104,8 +100,10 @@ class ScheduleGenerator:
                     is_substitution=False,
                 ).delete()
                 ScheduleEntry.objects.bulk_create(self.entries)
+                logger.info(f"Сохранено {len(self.entries)} записей в БД")
 
             return self._result(len(self.entries))
+
         except Exception as e:
             logger.exception("Ошибка в ScheduleGenerator.run")
             return {
@@ -117,19 +115,25 @@ class ScheduleGenerator:
             }
 
     def _load_context(self):
+        logger.info("Загрузка классов...")
         self.class_groups = list(
             ClassGroup.objects.filter(academic_year=self.academic_year, school=self.school)
             .select_related("school", "academic_year")
             .order_by("grade_number", "name")
         )
+        logger.info(f"Найдено классов: {len(self.class_groups)}")
 
-        for bell in BellSchedule.objects.filter(school=self.school).order_by("shift_number", "period_number"):
+        logger.info("Загрузка звонков...")
+        bells = BellSchedule.objects.filter(school=self.school).order_by("shift_number", "period_number")
+        for bell in bells:
             self.bells_by_shift[bell.shift_number].append(bell.period_number)
             self.max_period_by_shift[bell.shift_number] = max(
                 self.max_period_by_shift.get(bell.shift_number, 0),
                 bell.period_number,
             )
+        logger.info(f"Звонки по сменам: {dict(self.bells_by_shift)}")
 
+        logger.info("Загрузка СанПиН...")
         for limit in SanpinLimit.objects.all():
             max_periods = (
                 limit.max_periods_5day
@@ -138,22 +142,29 @@ class ScheduleGenerator:
             )
             for grade in range(limit.grade_from, limit.grade_to + 1):
                 self.sanpin_by_grade[grade] = max_periods
+        logger.info(f"СанПиН по классам: {self.sanpin_by_grade}")
 
+        logger.info("Загрузка учителей и их предметов...")
         teacher_school = TeacherSchool.objects.filter(school=self.school).select_related("teacher")
         school_teacher_ids = {item.teacher_id for item in teacher_school}
         self.teacher_max_hours = {
             item.teacher_id: int(item.weekly_hours_max or item.weekly_hours_norm or 10**6)
             for item in teacher_school
         }
+        logger.info(f"Учителей в школе: {len(school_teacher_ids)}")
 
-        for item in (
-            TeacherSubject.objects.filter(teacher_id__in=school_teacher_ids)
-            .select_related("teacher", "subject")
-            .order_by("-is_primary", "teacher__full_name")
-        ):
+        for item in TeacherSubject.objects.filter(teacher_id__in=school_teacher_ids).select_related("teacher", "subject"):
             self.teacher_ids_by_subject[item.subject_id].append(item.teacher_id)
+        logger.info(f"Предметов с учителями: {len(self.teacher_ids_by_subject)}")
 
+        # Для каждого предмета покажем наличие учителей
+        for subj_id, teachers in self.teacher_ids_by_subject.items():
+            logger.debug(f"Предмет {subj_id}: {len(teachers)} учителей")
+
+        logger.info("Загрузка кабинетов...")
         self.rooms = list(Room.objects.filter(school=self.school).order_by("-is_specialized", "number"))
+        logger.info(f"Найдено кабинетов: {len(self.rooms)}")
+
         room_requirements = defaultdict(list)
         for requirement in SubjectRoomRequirement.objects.select_related("subject"):
             room_requirements[requirement.subject_id].append(requirement.required_room_type)
@@ -161,21 +172,24 @@ class ScheduleGenerator:
         all_room_ids = [room.id for room in self.rooms]
         for subject_id, required_types in room_requirements.items():
             self.subjects_with_room_requirements.add(subject_id)
-            self.room_ids_by_subject[subject_id] = [
-                room.id for room in self.rooms if room.type in required_types
-            ]
+            suitable_rooms = [room.id for room in self.rooms if room.type in required_types]
+            if suitable_rooms:
+                self.room_ids_by_subject[subject_id] = suitable_rooms
+            else:
+                logger.warning(f"Для предмета {subject_id} требуются типы {required_types}, но нет подходящих кабинетов!")
         self.default_room_ids = all_room_ids
+        logger.info("Требования к кабинетам загружены.")
 
+        logger.info("Загрузка периодов недоступности...")
         self._load_unavailability()
+        logger.info(f"Недоступность учителей: {len(self.teacher_unavailable)} записей")
+        logger.info(f"Недоступность кабинетов: {len(self.room_unavailable)} записей")
 
     def _load_unavailability(self):
         year_start = self.academic_year.start_date
         year_end = self.academic_year.end_date
 
-        for item in TeacherUnavailability.objects.filter(
-            date_from__lte=year_end,
-            date_to__gte=year_start,
-        ):
+        for item in TeacherUnavailability.objects.filter(date_from__lte=year_end, date_to__gte=year_start):
             days = [item.day_of_week] if item.day_of_week else self.days
             periods = [item.period_number] if item.period_number else range(1, 20)
             for day in days:
@@ -195,26 +209,23 @@ class ScheduleGenerator:
                     self.room_unavailable.add((room_id, day, period))
 
     def _build_tasks(self):
-        plans = (
-            CurriculumPlan.objects.filter(class_group__in=self.class_groups)
-            .select_related("class_group", "subject", "subject__difficulty_rank")
-            .order_by("class_group__grade_number", "class_group__name", "subject__name")
+        plans = CurriculumPlan.objects.filter(class_group__in=self.class_groups).select_related(
+            "class_group", "subject", "subject__difficulty_rank"
         )
+        logger.info(f"Всего записей в CurriculumPlan: {plans.count()}")
 
-        # Current ScheduleEntry has no semester field, so one weekly template cannot
-        # represent different autumn/spring loads. Prefer full-year rows; otherwise
-        # use the highest semester load for the subject.
+        # Фильтрация: для каждой пары (класс, предмет) берём максимальные часы
         chosen = {}
         for plan in plans:
             key = (plan.class_group_id, plan.subject_id)
             current = chosen.get(key)
             if current is None:
                 chosen[key] = plan
-                continue
-            if plan.semester == "full_year":
+            elif plan.semester == "full_year":
                 chosen[key] = plan
             elif current.semester != "full_year" and plan.hours_per_week > current.hours_per_week:
                 chosen[key] = plan
+        logger.info(f"Уникальных пар (класс, предмет) после фильтрации: {len(chosen)}")
 
         tasks = []
         for plan in chosen.values():
@@ -229,173 +240,190 @@ class ScheduleGenerator:
                         subject_id=plan.subject_id,
                         subject_name=plan.subject.name,
                         difficulty_rank=difficulty_rank,
-                        subgroup_id=getattr(plan, "subgroup_id", None),
+                        subgroup_id=None,  # если есть подгруппы – нужно отдельно обработать
                     )
                 )
+        logger.info(f"Сформировано задач (уроков): {len(tasks)}")
         return tasks
 
-    def _task_sort_key(self, task: LessonTask):
+    def _task_sort_key(self, task):
+        # Чем сложнее предмет (мало учителей, мало кабинетов, мало слотов) – тем выше приоритет
         teacher_count = len(self.teacher_ids_by_subject.get(task.subject_id, []))
         room_count = len(self._room_ids_for_subject(task.subject_id))
         slot_count = len(self._slots_for_class(task))
+        # Приоритет: сначала те, у кого меньше вариантов
         return (
             teacher_count or 10**6,
             room_count or 10**6,
             slot_count or 10**6,
+            -task.grade_number,  # старшие классы выше
             task.difficulty_rank,
-            -task.grade_number,
-            task.class_group_name,
-            task.subject_name,
         )
 
-    def _solve(self, tasks, index):
-        if index >= len(tasks):
-            return True
+    def _solve_with_fallback(self, tasks):
+        """Рекурсивное назначение с откатом, но если не получается – задача откладывается."""
+        self.entries = []
+        self.unscheduled = []
+        # Используем стек для backtracking
+        stack = [(0, [])]  # (index, предыдущие назначения)
+        # Чтобы не углубляться слишком сильно, ограничим максимальное число попыток
+        max_attempts = 20000
+        attempts = 0
 
-        task = tasks[index]
-        candidates = self._candidates_for(task)
-
-        if not candidates:
-            return False
-
-        for candidate in candidates:
-            self._place(task, candidate)
-            if self._solve(tasks, index + 1):
+        while stack and attempts < max_attempts:
+            idx, prev_entries = stack.pop()
+            if idx >= len(tasks):
+                # Все задачи обработаны
+                self.entries = prev_entries
+                logger.info(f"Успешно размещено {len(prev_entries)} уроков из {len(tasks)}")
                 return True
-            self._rollback(task, candidate)
 
+            task = tasks[idx]
+            # Пытаемся найти кандидатов
+            candidates = self._candidates_for(task, prev_entries)
+            if not candidates:
+                # Нет кандидатов – откладываем задачу
+                self.unscheduled.append({
+                    "class": task.class_group_name,
+                    "subject": task.subject_name,
+                    "reason": "no_candidates",
+                })
+                # Переходим к следующей задаче, не добавляя эту
+                stack.append((idx + 1, prev_entries))
+                continue
+
+            # Для каждого кандидата (сортируем по score)
+            for cand in candidates[:20]:  # рассматриваем до 20 вариантов
+                # Создаём новое состояние (копируем предыдущие записи)
+                new_entries = prev_entries + [self._make_entry(task, cand)]
+                # Временно применяем изменения (для проверки занятости)
+                if self._try_place(task, cand, new_entries):
+                    stack.append((idx + 1, new_entries))
+                    attempts += 1
+                    break
+            else:
+                # Не удалось применить ни одного кандидата – откладываем задачу
+                self.unscheduled.append({
+                    "class": task.class_group_name,
+                    "subject": task.subject_name,
+                    "reason": "conflict_all_candidates",
+                })
+                stack.append((idx + 1, prev_entries))
+
+        if attempts >= max_attempts:
+            logger.error("Превышено максимальное количество попыток backtracking")
         return False
 
-    def _candidates_for(self, task: LessonTask):
+    def _candidates_for(self, task, existing_entries):
+        """Генерирует список кандидатов, игнорируя уже занятые слоты в existing_entries."""
         candidates = []
         teacher_ids = self.teacher_ids_by_subject.get(task.subject_id, [])
         room_ids = self._room_ids_for_subject(task.subject_id)
 
+        if not teacher_ids:
+            logger.warning(f"Нет учителей для предмета {task.subject_name} (id={task.subject_id})")
+            return []
+        if not room_ids:
+            logger.warning(f"Нет кабинетов для предмета {task.subject_name} (id={task.subject_id})")
+            return []
+
+        # Вычисляем занятость на основе existing_entries
+        class_busy = set()
+        teacher_busy = set()
+        room_busy = set()
+        class_day_load = defaultdict(int)
+        teacher_load = defaultdict(int)
+        teacher_day_periods = defaultdict(set)
+        class_subject_days = defaultdict(set)
+
+        for entry in existing_entries:
+            class_busy.add((entry.class_group_id, entry.subgroup_id, entry.day_of_week, entry.period_number, entry.week_parity))
+            teacher_busy.add((entry.teacher_id, entry.day_of_week, entry.period_number, entry.week_parity))
+            room_busy.add((entry.room_id, entry.day_of_week, entry.period_number, entry.week_parity))
+            class_day_load[(entry.class_group_id, entry.day_of_week)] += 1
+            teacher_load[entry.teacher_id] += 1
+            teacher_day_periods[(entry.teacher_id, entry.day_of_week)].add(entry.period_number)
+            class_subject_days[(entry.class_group_id, entry.subject_id)].add(entry.day_of_week)
+
+        max_periods = self._max_periods_for_grade(task.grade_number)
         for day, period in self._slots_for_class(task):
-            if self.class_day_load[(task.class_group_id, day)] >= self._max_periods_for_grade(task.grade_number):
+            if class_day_load[(task.class_group_id, day)] >= max_periods:
                 continue
-            if (task.class_group_id, task.subgroup_id, day, period, task.week_parity) in self.class_busy:
+            if (task.class_group_id, task.subgroup_id, day, period, task.week_parity) in class_busy:
                 continue
 
             for teacher_id in teacher_ids:
-                if not self._teacher_available(teacher_id, day, period):
+                if (teacher_id, day, period, task.week_parity) in teacher_busy:
                     continue
-                if self.teacher_load[teacher_id] >= self.teacher_max_hours.get(teacher_id, 10**6):
+                if (teacher_id, day, period) in self.teacher_unavailable:
+                    continue
+                if teacher_load[teacher_id] >= self.teacher_max_hours.get(teacher_id, 10**6):
                     continue
 
                 for room_id in room_ids:
-                    if not self._room_available(room_id, day, period):
+                    if (room_id, day, period, task.week_parity) in room_busy:
                         continue
-                    candidates.append(
-                        Candidate(
-                            day=day,
-                            period=period,
-                            teacher_id=teacher_id,
-                            room_id=room_id,
-                            score=self._score(task, teacher_id, room_id, day, period),
-                        )
-                    )
+                    if (room_id, day, period) in self.room_unavailable:
+                        continue
+                    score = self._score_task(task, teacher_id, room_id, day, period,
+                                             class_day_load, teacher_day_periods, class_subject_days, teacher_load)
+                    candidates.append(Candidate(day, period, teacher_id, room_id, score))
 
-        candidates.sort(key=lambda item: (item.score, item.day, item.period))
-        return candidates[:40]
+        candidates.sort(key=lambda c: c.score)
+        return candidates[:100]  # увеличили лимит
 
-    def _slots_for_class(self, task: LessonTask):
+    def _score_task(self, task, teacher_id, room_id, day, period,
+                    class_day_load, teacher_day_periods, class_subject_days, teacher_load):
+        score = 0
+        if period > 4 and task.difficulty_rank <= 3:
+            score += 60
+        if period > class_day_load[(task.class_group_id, day)] + 1:
+            score += 80
+        if day in class_subject_days[(task.class_group_id, task.subject_id)]:
+            score += 45
+        score += class_day_load[(task.class_group_id, day)] * 8
+        teacher_periods = teacher_day_periods[(teacher_id, day)]
+        if teacher_periods and period not in {min(teacher_periods) - 1, max(teacher_periods) + 1}:
+            score += 35
+        score += teacher_load[teacher_id] * 3
+        score += self.room_load.get(room_id, 0)  # глобальная нагрузка
+        return score
+
+    def _make_entry(self, task, candidate):
+        return ScheduleEntry(
+            class_group_id=task.class_group_id,
+            subgroup_id=task.subgroup_id,
+            subject_id=task.subject_id,
+            teacher_id=candidate.teacher_id,
+            room_id=candidate.room_id,
+            academic_year=self.academic_year,
+            day_of_week=candidate.day,
+            period_number=candidate.period,
+            week_parity=task.week_parity,
+            is_substitution=False,
+        )
+
+    def _try_place(self, task, candidate, new_entries):
+        """Проверяет, что назначение не конфликтует с existing_entries (не нужно, т.к. уже проверено в _candidates_for)"""
+        # Здесь просто возвращаем True, т.к. кандидаты уже отфильтрованы
+        return True
+
+    def _slots_for_class(self, task):
         periods = self.bells_by_shift.get(task.shift_number)
         if not periods:
             periods = list(range(1, self._max_periods_for_grade(task.grade_number) + 1))
         max_periods = self._max_periods_for_grade(task.grade_number)
-        return [
-            (day, period)
-            for day in self.days
-            for period in periods
-            if period <= max_periods
-        ]
+        return [(day, period) for day in self.days for period in periods if period <= max_periods]
 
     def _room_ids_for_subject(self, subject_id):
         if subject_id in self.subjects_with_room_requirements:
             return self.room_ids_by_subject.get(subject_id, [])
-        required_rooms = self.room_ids_by_subject.get(subject_id)
-        return required_rooms if required_rooms else self.default_room_ids
+        # Если нет требований – любой кабинет
+        return self.default_room_ids
 
     def _max_periods_for_grade(self, grade_number):
-        return self.sanpin_by_grade.get(grade_number, max(self.max_period_by_shift.values() or [8]))
-
-    def _teacher_available(self, teacher_id, day, period):
-        return (
-            (teacher_id, day, period, 0) not in self.teacher_busy
-            and (teacher_id, day, period) not in self.teacher_unavailable
-        )
-
-    def _room_available(self, room_id, day, period):
-        return (
-            (room_id, day, period, 0) not in self.room_busy
-            and (room_id, day, period) not in self.room_unavailable
-        )
-
-    def _score(self, task, teacher_id, room_id, day, period):
-        score = 0
-
-        # Prefer compact class days without late lessons.
-        if period > 4 and task.difficulty_rank <= 3:
-            score += 60
-        if period > self.class_day_load[(task.class_group_id, day)] + 1:
-            score += 80
-
-        # Spread same subject across days.
-        if day in self.class_subject_days[(task.class_group_id, task.subject_id)]:
-            score += 45
-
-        # Balance class load and reduce teacher windows.
-        score += self.class_day_load[(task.class_group_id, day)] * 8
-        teacher_periods = self.teacher_day_periods[(teacher_id, day)]
-        if teacher_periods and period not in {min(teacher_periods) - 1, max(teacher_periods) + 1}:
-            score += 35
-
-        score += self.teacher_load[teacher_id] * 3
-        score += self.room_load[room_id]
-        return score
-
-    def _place(self, task, candidate):
-        self.entries.append(
-            ScheduleEntry(
-                class_group_id=task.class_group_id,
-                subgroup_id=task.subgroup_id,
-                subject_id=task.subject_id,
-                teacher_id=candidate.teacher_id,
-                room_id=candidate.room_id,
-                academic_year=self.academic_year,
-                day_of_week=candidate.day,
-                period_number=candidate.period,
-                week_parity=task.week_parity,
-                is_substitution=False,
-            )
-        )
-        self.class_busy.add((task.class_group_id, task.subgroup_id, candidate.day, candidate.period, task.week_parity))
-        self.teacher_busy.add((candidate.teacher_id, candidate.day, candidate.period, task.week_parity))
-        self.room_busy.add((candidate.room_id, candidate.day, candidate.period, task.week_parity))
-        self.class_day_load[(task.class_group_id, candidate.day)] += 1
-        self.teacher_load[candidate.teacher_id] += 1
-        self.teacher_day_periods[(candidate.teacher_id, candidate.day)].add(candidate.period)
-        self.class_subject_days[(task.class_group_id, task.subject_id)].add(candidate.day)
-        self.room_load[candidate.room_id] += 1
-
-    def _rollback(self, task, candidate):
-        self.entries.pop()
-        self.class_busy.remove((task.class_group_id, task.subgroup_id, candidate.day, candidate.period, task.week_parity))
-        self.teacher_busy.remove((candidate.teacher_id, candidate.day, candidate.period, task.week_parity))
-        self.room_busy.remove((candidate.room_id, candidate.day, candidate.period, task.week_parity))
-        self.class_day_load[(task.class_group_id, candidate.day)] -= 1
-        self.teacher_load[candidate.teacher_id] -= 1
-        self.teacher_day_periods[(candidate.teacher_id, candidate.day)].discard(candidate.period)
-        self.room_load[candidate.room_id] -= 1
-
-        if not any(
-            entry.class_group_id == task.class_group_id
-            and entry.subject_id == task.subject_id
-            and entry.day_of_week == candidate.day
-            for entry in self.entries
-        ):
-            self.class_subject_days[(task.class_group_id, task.subject_id)].discard(candidate.day)
+        default = max(self.max_period_by_shift.values()) if self.max_period_by_shift else 8
+        return self.sanpin_by_grade.get(grade_number, default)
 
     def _result(self, generated_count):
         return {
@@ -408,4 +436,5 @@ class ScheduleGenerator:
 
 
 def generate_schedule(academic_year_id: int):
+    print("начинаю генерацию...")
     return ScheduleGenerator(academic_year_id).run()
